@@ -38,5 +38,7 @@ int gpu_unlock_fwsec_patch_frts(u8 *image, const struct gpu_unlock_fwsec *fw,
 				u64 frts_offset);
 int gpu_unlock_fwsec_sig_offset(u32 versions, u32 fuse_version, u32 sig_size,
 				u32 *offset);
+/* Whole 256-byte DMA blocks must remain inside the existing image. */
+int gpu_unlock_fwsec_dmem_transfer(const struct gpu_unlock_fwsec *fw, u32 *bytes);
 
 #endif

@@ -323,6 +323,11 @@ static int falcon_dma(struct unlock_transaction_work *work, u32 base, u32 dest, 
 	ret = poll_us(work, base + 0x118, 1, 0, 1000000, true);
 	if (ret)
 		return GU_RESULT(ret);
+	/* From this point our buffers may become DMA-visible. Never clear this
+	 * on a later preflight error: earlier transfers may still reference them.
+	 * Geometry and initial queue failures before exposure remain reclaimable.
+	 */
+	work->firmware_started = true;
 	write_bar(work, base + 0x110, lower_32_bits(src >> 8));
 	write_bar(work, base + 0x128, upper_32_bits(src >> 8) & 0x1ff);
 	while (done < size) {
@@ -895,7 +900,7 @@ static int unlock_transaction_fwsec(struct unlock_transaction_work *work)
 	size_t mapped = 0;
 	u8 *rom = NULL;
 	struct gpu_unlock_fwsec fw;
-	u32 fuse_raw, version, scratch, wpr_lo, wpr_hi;
+	u32 fuse_raw, version, scratch, wpr_lo, wpr_hi, dmem_transfer;
 	u16 command;
 	u64 frts = work->layout.frts_offset;
 	void *image = NULL;
@@ -924,6 +929,12 @@ static int unlock_transaction_fwsec(struct unlock_transaction_work *work)
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
+	/* Match NVIDIA's block DMA without reading beyond existing image padding. */
+	ret = gpu_unlock_fwsec_dmem_transfer(&fw, &dmem_transfer);
+	if (ret)
+		goto out;
+	dev_info(&work->pdev->dev, "FWSEC DMEM: declared=%#x transfer=%#x image=%#x data_offset=%#x\n",
+		 fw.dmem_size, dmem_transfer, fw.image_size, fw.data_off);
 	image = diag_dma_alloc(work, "fwsec", fw.image_size, &image_dma, GFP_KERNEL);
 	if (!image) {
 		ret = -ENOMEM;
@@ -958,9 +969,8 @@ static int unlock_transaction_fwsec(struct unlock_transaction_work *work)
 		ret = -EIO;
 		goto out;
 	}
-	work->firmware_started = true;
 	ret = falcon_hs(work, &gsp, 0, fw.imem_size, fw.imem_va, fw.imem_pa,
-			fw.data_off, fw.dmem_size, fw.dmem_pa, fw.pkc_off,
+			fw.data_off, dmem_transfer, fw.dmem_pa, fw.pkc_off,
 			fw.engine_mask, fw.ucode_id,
 			image_dma, 0, 0, false);
 	if (ret)

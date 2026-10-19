@@ -279,6 +279,22 @@ static void load_rom(const char *path) {
     assert(prom && fread(rom,1,1024*1024,prom)==1024*1024);
     assert(fgetc(prom)==EOF);fclose(prom);
 }
+/* Published GA107 FWSEC geometry, not captured ROM bytes from either GPU.
+ * The chip identity and VRAM layout still come from the selected mock profile. */
+static void synthetic_partial_dmem_rom(u8 *rom) {
+    vbios_fixture(rom,6);
+    rom[48]=128;
+    vbios_w32(rom+256,(0x62cu<<16)|0x301);
+    vbios_w32(rom+260,0xec80);
+    vbios_w32(rom+264,0x724); vbios_w32(rom+268,0x1c);
+    vbios_w32(rom+276,0xe300); vbios_w32(rom+288,0x980);
+    rom[292]=0;rom[293]=4;rom[294]=9;rom[295]=4;rom[296]=0xf;
+    u8 *dmem=rom+256+0x62c+0xe300;
+    dmem[0x1c]=1;dmem[0x1d]=4;dmem[0x1e]=8;dmem[0x1f]=2;
+    vbios_w32(dmem+0x20,4);vbios_w32(dmem+0x24,0x40);
+    dmem[0x44]=3;dmem[0x46]=64;
+    vbios_w32(dmem+0x48,0x940);vbios_w32(dmem+0x4c,64);
+}
 int main(int argc, char **argv) {
     struct unlock_transaction_work w;
     setup(&w);
@@ -322,6 +338,7 @@ int main(int argc, char **argv) {
         else fake.dma_stall_after=1;
         assert(falcon_dma(&w,SEC2_BASE,0,0,0x100000,mode==2?256:512,0x614)==-ETIMEDOUT);
         assert(fake.dma_commands==(mode?1:0) && fake.now<=1000100);
+        assert(w.firmware_started==(mode!=0));
         if(mode==1)assert(strstr(fake.log,"Falcon DMA progress: done=256 total=512"));
     }
     for(int mode=0;mode<4;mode++) {
@@ -346,7 +363,12 @@ int main(int argc, char **argv) {
         if(bad==4)src++;
         assert(falcon_dma(&w,SEC2_BASE,dest,off,src,size,0x614)==-EINVAL);
         assert(!fake.writes);
+        assert(!w.firmware_started);
     }
+    /* A later rejected transfer must never erase prior DMA exposure. */
+    setup(&w);w.firmware_started=true;
+    assert(falcon_dma(&w,SEC2_BASE,0,0,0x100000,257,0x614)==-EINVAL);
+    assert(w.firmware_started && !fake.writes);
     {
         const struct falcon_eng eng={SEC2_BASE,SEC2_FBIF,SEC2_FALCON2};
         setup(&w);
@@ -579,7 +601,9 @@ int main(int argc, char **argv) {
             "wpr-disabled-zero","wpr-inverted","wpr-inaccessible",
             "post-gfw-late","post-gfw-timeout","post-gfw-inaccessible","post-gsp-resumed",
             "wpr-frts-retained","firmware-group-oom-first","firmware-group-oom-later","devres-preexisting","devres-at-handoff",
-            "warm-wpr2","ss1-readback","ss1-lost"};
+            "warm-wpr2","ss1-readback","ss1-lost","fwsec-partial-dmem",
+            "fwsec-unaligned-data","fwsec-imem-preflight","fwsec-initial-queue",
+            "fwsec-exposed-timeout","initial-bme-rejected"};
         int total_allocations=0;
         for(unsigned scenario=0;scenario<ARRAY_SIZE(cases);scenario++) {
             setup(&w);
@@ -645,12 +669,21 @@ int main(int argc, char **argv) {
             if(scenario==55)regs[0x1fa828/4]=fake.fwsec_wpr_hi; /* a driver already ran FWSEC */
             if(scenario==56)fake.selector_bad=2;
             if(scenario==57)fake.corrupt_selector=2;
+            if(scenario>=58 && scenario<=62) {
+                synthetic_partial_dmem_rom((u8 *)regs+0x300000);
+                regs[(0x8241c0+8*4)/4]=3;
+                if(scenario==59)vbios_w32((u8 *)regs+0x300000+276,0xe301);
+                if(scenario==60)vbios_w32((u8 *)regs+0x300000+280,1);
+                if(scenario==61)regs[0x110118/4]=1;
+                if(scenario==62)fake.dma_stall_after=1;
+            }
+            if(scenario==63)fake.cmd=7;
             /* As main.c: the GSP file is loaded once, ahead of every card. */
             struct gpu_unlock_610_shared shared={0};last_work=NULL;
             int ret=gpu_unlock_610_load_shared(&dev,&shared);
             if(!ret)ret=gpu_unlock_610_unlock(&dev,&shared);
             gpu_unlock_610_release_shared(&shared);
-            bool expected=scenario<2 || (scenario>=33 && scenario<=35) || scenario==39 || scenario==40 || scenario==43 || scenario==46;
+            bool expected=scenario<2 || (scenario>=33 && scenario<=35) || scenario==39 || scenario==40 || scenario==43 || scenario==46 || scenario==58;
             bool retained=fake.pins;
             if((!ret)!=expected)fprintf(stderr,"%s\n%s: error=%d\n",fake.log,cases[scenario],ret);
             assert((!ret)==expected);
@@ -682,12 +715,14 @@ int main(int argc, char **argv) {
             assert(fake.selector_writes<=1 && fake.ss1_writes<=1);
             if(retained) {
                 assert(last_work->retained && fake.live>0 && dev.refs==2);
+                if(scenario==62)assert(fake.regions==1 && (fake.cmd&PCI_COMMAND_MASTER));
                 /* Harness-only disposal of intentionally retained production state. */
                 last_work->firmware_started=false;fake.restore_mask_fail=0;
                 assert(!unlock_transaction_unwind(last_work));
                 pci_dev_put(last_work->pdev);free(last_work);
             }
-            assert(!fake.live && !fake.fw_live && dev.refs==1 && !(fake.cmd&4));
+            assert(!fake.live && !fake.fw_live && dev.refs==1);
+            assert((fake.cmd&PCI_COMMAND_MASTER)==(scenario==63?PCI_COMMAND_MASTER:0));
             assert(!fake.group_live && fake.cache_records==fake.cache_released);
             assert(dev.dev.devres_head.count==(scenario==53 || scenario==54?1u:0u));
             if(scenario>=51 && scenario<=53)assert(!fake.writes && !fake.allocs && !fake.flrs);
@@ -698,6 +733,27 @@ int main(int argc, char **argv) {
             if(scenario==33)assert(fake.cmd==0);
             if(scenario==56)assert(ret==-EIO && retained && fake.ss1_writes==1 && !fake.flrs);
             if(scenario==57)assert(ret==-EIO && !retained && fake.flrs==1);
+            if(scenario==58) {
+                assert(strstr(fake.log,"FWSEC DMEM: declared=0x980 transfer=0xa00"));
+                assert(strstr(fake.log,"size=0xa00"));
+            }
+            if(scenario>=59 && scenario<=61) {
+                if(retained)fprintf(stderr,"%s: premature pre-DMA retention\n",cases[scenario]);
+                assert(ret==(scenario==61?-ETIMEDOUT:-EINVAL));
+                assert(!retained && !fake.regions && !fake.live);
+                assert(!fake.dma_commands && !fake.gsp_starts && !fake.starts && !fake.flrs);
+                assert(!fake.selector_writes && !fake.ss1_writes);
+            }
+            if(scenario==62) {
+                /* Retention was checked before the harness-only disposal above. */
+                assert(ret==-ETIMEDOUT && retained);
+                assert(fake.dma_commands==1 && !fake.gsp_starts && !fake.flrs);
+            }
+            if(scenario==63) {
+                assert(ret==-EBUSY && !retained && !fake.live && !fake.regions);
+                assert(fake.cmd==7);
+                assert(!fake.writes && !fake.dma_commands && !fake.flrs);
+            }
             if(scenario==55) {
                 assert(ret==-EBUSY && !retained && !fake.gsp_starts && !fake.starts && !fake.flrs);
                 assert(strstr(fake.log,"card already initialised since power on"));

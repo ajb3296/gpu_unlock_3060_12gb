@@ -19,6 +19,32 @@ int main(int argc, char **argv)
 	u8 rom[4096], image[1280] = {0};
 	struct gpu_unlock_fwsec fw;
 	u32 offset;
+	/* Bounded DMA rounding; geometry is synthetic, not this board's ROM. */
+	{
+		u32 bytes = 0;
+		struct gpu_unlock_fwsec geometry = {
+			.image_size=0xed00, .data_off=0xe300, .dmem_size=0x980,
+		};
+		assert(!gpu_unlock_fwsec_dmem_transfer(&geometry, &bytes) && bytes==0xa00);
+		geometry.image_size=0xec80;
+		bytes=0xdeadbeef;
+		assert(gpu_unlock_fwsec_dmem_transfer(&geometry, &bytes)==-ERANGE);
+		assert(bytes==0xdeadbeef);
+		geometry.image_size=0xed00; geometry.data_off++;
+		assert(gpu_unlock_fwsec_dmem_transfer(&geometry, &bytes)==-EINVAL);
+		geometry.data_off=0xe300; geometry.dmem_pa=1;
+		assert(gpu_unlock_fwsec_dmem_transfer(&geometry, &bytes)==-EINVAL);
+		geometry.dmem_pa=0; geometry.dmem_size=0;
+		assert(gpu_unlock_fwsec_dmem_transfer(&geometry, &bytes)==-EINVAL);
+		geometry.dmem_size=0xffffffff;
+		assert(gpu_unlock_fwsec_dmem_transfer(&geometry, &bytes)==-EINVAL);
+		geometry.dmem_size=256; geometry.dmem_pa=(1u<<24)-256;
+		assert(!gpu_unlock_fwsec_dmem_transfer(&geometry, &bytes) && bytes==256);
+		geometry.dmem_size=257;
+		assert(gpu_unlock_fwsec_dmem_transfer(&geometry, &bytes)==-ERANGE);
+		assert(gpu_unlock_fwsec_dmem_transfer(NULL, &bytes)==-EINVAL);
+		assert(gpu_unlock_fwsec_dmem_transfer(&geometry, NULL)==-EINVAL);
+	}
 
 	for (int stride = 6; stride <= 8; stride += 2) {
 		vbios_fixture(rom, stride);

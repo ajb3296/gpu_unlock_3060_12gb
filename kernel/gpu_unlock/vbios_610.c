@@ -247,6 +247,22 @@ int gpu_unlock_fwsec_sig_offset(u32 versions, u32 fuse_version, u32 sig_size, u3
 	return 0;
 }
 
+/* Adapted from IHaBiS02/ga107-unlock, commit 5e6b360 (GPL-2.0-only). */
+int gpu_unlock_fwsec_dmem_transfer(const struct gpu_unlock_fwsec *fw, u32 *bytes)
+{
+	u32 rounded;
+
+	if (!fw || !bytes || !fw->dmem_size || fw->dmem_size > ~(u32)0 - 255 ||
+	    ((fw->data_off | fw->dmem_pa) & 255))
+		return GU_DIAG(-EINVAL);
+	rounded = (fw->dmem_size + 255) & ~255u;
+	if (range(fw->image_size, fw->data_off, rounded) ||
+	    (u64)fw->dmem_pa + rounded > (1ull << 24))
+		return GU_DIAG(-ERANGE);
+	*bytes = rounded;
+	return 0;
+}
+
 int gpu_unlock_fwsec_patch_frts(u8 *image, const struct gpu_unlock_fwsec *fw, u64 frts_offset)
 {
 	u8 *dmem, *mapper = NULL;

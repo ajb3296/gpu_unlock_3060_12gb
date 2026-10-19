@@ -36,6 +36,25 @@ https://github.com/NVIDIA/open-gpu-kernel-modules/blob/610.43.03/src/nvidia/gene
 The pinned 610.43.03 inputs and V67 payload are unchanged. SS1's effect remains
 untested, as in upstream. No throughput or numerical-correctness claim is made.
 
+## FWSEC safety backports
+
+The bounded DMEM block-rounding helper and DMA-exposure tracking fix are adapted
+from `IHaBiS02/ga107-unlock` commit
+`5e6b3600bb01142891d43d62120727e96911d1a6` (GPL-2.0-only).
+DMEM transfers round up to whole 256-byte blocks only when the existing image
+contains the complete transfer; overflow, misalignment and range violations fail
+closed. Buffers become potentially firmware-visible immediately before DMA
+source/base programming, not before geometry or initial-queue checks. Failures
+after possible DMA exposure still retain resources unless quiescence is proven.
+
+Regressions cover partial DMEM, pre-DMA cleanup, post-DMA retention and the
+unchanged initial-BME rejection in both GA102 and synthetic 12-GiB GA106 profiles.
+These changes do **not** normalize initial Bus Master state or change SS0/SS1
+policy. They are source/build changes only, not installation into the running
+kernel or the previously created trial initramfs. Updating that image and any
+physical trial require a separate operation. Falcon destination encoding checks
+also do not establish the physical IMEM/DMEM capacity of an unfamiliar engine.
+
 ## Build and host verification only
 
 ```sh
