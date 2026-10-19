@@ -20,10 +20,13 @@ int gpu_unlock_610_load_shared(struct pci_dev *pdev, struct gpu_unlock_610_share
 void gpu_unlock_610_release_shared(struct gpu_unlock_610_shared *shared);
 
 /*
- * Unlock one cold, unbound RTX 3090. The caller holds pci_dev_lock. Returns 0
- * when the card is unlocked and handed back as found; otherwise a negative
- * errno, with the card left locked. Unlocks of different cards may run
- * concurrently with the same shared firmware.
+ * Run the unlock sequence on one cold, unbound RTX 3090 or an explicitly
+ * opted-in experimental RTX 3060 GA106. The caller validates the model and
+ * opt-in policy and holds pci_dev_lock. Returns 0 after selector readback and
+ * driver-handoff checks; this is not proof of a throughput improvement.
+ * A negative errno does not guarantee rollback of partial GPU state changes;
+ * firmware-visible DMA may be retained until power-off. Different cards may
+ * run concurrently with the same shared firmware.
  */
 int gpu_unlock_610_unlock(struct pci_dev *pdev, const struct gpu_unlock_610_shared *shared);
 

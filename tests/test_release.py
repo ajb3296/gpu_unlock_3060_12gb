@@ -48,6 +48,26 @@ class ComponentTests(unittest.TestCase):
                     args = [str(output)]
                     if name == "unlock_adapter" and ASSETS:
                         args += ["-", str(ASSETS)]
-                    result = subprocess.run(args, capture_output=True, text=True)
+                    baseline_env = {k: v for k, v in os.environ.items()
+                                    if k != "GPU_UNLOCK_TEST_GA106"}
+                    result = subprocess.run(args, capture_output=True, text=True,
+                                            env=baseline_env)
                     self.assertEqual(result.returncode, 0,
                                      (result.stdout + result.stderr)[-4000:])
+                    if name == "unlock_adapter" and ASSETS:
+                        self.assertIn("GA102 24-GiB pinned firmware transactions", result.stdout)
+                        with self.subTest(profile="GA106 synthetic 12-GiB"):
+                            result = subprocess.run(
+                                args, capture_output=True, text=True,
+                                env={**baseline_env, "GPU_UNLOCK_TEST_GA106": "1"})
+                            self.assertEqual(result.returncode, 0,
+                                             (result.stdout + result.stderr)[-4000:])
+                            self.assertIn("GA106 synthetic 12-GiB pinned firmware transactions",
+                                          result.stdout)
+                        with self.subTest(profile="flag 0 preserves GA102"):
+                            result = subprocess.run(
+                                args, capture_output=True, text=True,
+                                env={**baseline_env, "GPU_UNLOCK_TEST_GA106": "0"})
+                            self.assertEqual(result.returncode, 0,
+                                             (result.stdout + result.stderr)[-4000:])
+                            self.assertIn("GA102 24-GiB pinned firmware transactions", result.stdout)

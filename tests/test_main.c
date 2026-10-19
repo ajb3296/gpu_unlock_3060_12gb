@@ -13,6 +13,21 @@
 
 #define MAX_DEVICES 8
 
+static struct { const char *name; void *address; } parameters[8];
+static unsigned int parameter_count;
+void test_register_parameter(const char *name, void *address)
+{
+	assert(parameter_count < 8);
+	parameters[parameter_count].name = name;
+	parameters[parameter_count++].address = address;
+}
+static void set_ga106_opt_in(bool value)
+{
+	for (unsigned int i = 0; i < parameter_count; i++)
+		if (!strcmp(parameters[i].name, "experimental_ga106"))
+			*(bool *)parameters[i].address = value;
+}
+
 static struct pci_dev devices[MAX_DEVICES];
 static unsigned int device_count;
 static char gsp_marker;
@@ -62,7 +77,8 @@ struct pci_dev *pci_get_device(unsigned int vendor, unsigned int device, struct 
 
 	pci_dev_put(from);
 	for (; i < device_count; i++)
-		if (devices[i].vendor == vendor && devices[i].device == device)
+		if (devices[i].vendor == vendor &&
+		    (device == PCI_ANY_ID || devices[i].device == device))
 			return pci_dev_get(&devices[i]);
 	return NULL;
 }
@@ -187,6 +203,7 @@ static void add(const char *name, unsigned short device, bool bound)
 	struct pci_dev *pdev = &devices[device_count++];
 
 	*pdev = (struct pci_dev){ .name = name, .vendor = PCI_VENDOR_ID_NVIDIA, .device = device,
+				  .revision = 0xa1,
 				  .driver = bound ? &driver_marker : NULL, .refs = 1 };
 	pthread_mutex_init(&pdev->lock, NULL);
 }
@@ -196,6 +213,7 @@ static void reset(char *list)
 	memset(&fake, 0, sizeof(fake));
 	device_count = 0;
 	targets = list;
+	set_ga106_opt_in(false);
 }
 
 /* Runs init, then checks what holds for every case. */
@@ -243,7 +261,7 @@ int main(void)
 	run();
 	assert(fake.max_in_flight == 2 && !fake.unlocks[0] && fake.unlocks[1] && fake.unlocks[2]);
 	assert(fake.loads == 1 && fake.load_dev == &devices[1] && fake.releases == 1);
-	assert(!logged("no RTX 3090"));
+	assert(!logged("no eligible GPU"));
 	puts("list: only listed cards, concurrently PASS");
 
 	/* One card failing leaves the others unlocked. */
@@ -273,7 +291,7 @@ int main(void)
 	add("0000:01:00.0", RTX_3090, false);
 	run();
 	assert(!fake.loads && !fake.started && fake.releases == 1);
-	assert(logged("gpu_unlock: no RTX 3090 at \"0000:99:00.0\""));
+	assert(logged("gpu_unlock: no eligible GPU at \"0000:99:00.0\""));
 	puts("unmatched target: reported, nothing loaded PASS");
 
 	/* No opt-in on the command line: the module does nothing. */
@@ -284,5 +302,91 @@ int main(void)
 		assert(!fake.loads && !fake.started && !fake.releases && !fake.log[0]);
 	}
 	puts("no targets: idle PASS");
+
+	/* GA106 must require both an explicit address and a separate opt-in. */
+	reset("0000:01:00.0");
+	add("0000:01:00.0", 0x2504, false);
+	set_ga106_opt_in(true);
+	run();
+	assert(fake.started == 1 && fake.unlocks[0] == 1);
+	puts("GA106 explicit opt-in: selected card unlocked PASS");
+	assert(logged("EXPERIMENTAL GA106"));
+
+	const unsigned short other_ids[] = {0x2504, 0x2503, 0x2487, 0x2507};
+	unsigned int matrix_cases = 0;
+	for (unsigned int id = 0; id < 4; id++)
+	for (int opt_in = 0; opt_in < 2; opt_in++)
+	for (int all = 0; all < 2; all++)
+	for (int bound = 0; bound < 2; bound++)
+	for (int wrong_revision = 0; wrong_revision < 2; wrong_revision++) {
+		reset(all ? "all" : "0000:01:00.0");
+		add("0000:01:00.0", other_ids[id], bound);
+		devices[0].revision = wrong_revision ? 0xb1 : 0xa1;
+		set_ga106_opt_in(opt_in);
+		run();
+		bool selected = id == 0 && opt_in && !all && !wrong_revision;
+		assert(fake.started == (selected && !bound ? 1 : 0));
+		if (!selected)
+			assert(!fake.loads && !fake.started);
+		matrix_cases++;
+	}
+	printf("GA106 selection safety matrix: %u cases PASS\n", matrix_cases);
+
+	reset("all");
+	add("0000:01:00.0", RTX_3090, false);
+	add("0000:21:00.0", 0x2504, false);
+	set_ga106_opt_in(true);
+	run();
+	assert(fake.started == 1 && fake.unlocks[0] && !fake.unlocks[1]);
+	puts("targets=all preserves RTX 3090 and excludes GA106 PASS");
+
+	reset("0000:01:00.0");
+	add("0000:01:00.0", 0x2504, false);
+	devices[0].vendor = 0x1234;
+	set_ga106_opt_in(true);
+	run();
+	assert(!fake.loads && !fake.started);
+	puts("non-NVIDIA matching device ID rejected PASS");
+
+	reset("0000:21:00.0");
+	add("0000:01:00.0", 0x2504, false);
+	set_ga106_opt_in(true);
+	run();
+	assert(!fake.loads && !fake.started);
+	puts("GA106 unlisted address rejected PASS");
+
+	const char *invalid_bdfs[] = {"01:00.0", "1:00.0", "0000:01:00",
+		"0000:01:00.*", "0000:*:00.0", "0000:01:00.0 "};
+	for (unsigned int i = 0; i < sizeof(invalid_bdfs) / sizeof(invalid_bdfs[0]); i++) {
+		reset((char *)invalid_bdfs[i]);
+		add("0000:01:00.0", 0x2504, false);
+		set_ga106_opt_in(true);
+		run();
+		assert(!fake.loads && !fake.started);
+	}
+	puts("abbreviated, wildcard and whitespace BDFs rejected PASS");
+
+	reset("all,0000:01:00.0");
+	add("0000:01:00.0", 0x2504, false);
+	add("0000:21:00.0", 0x2504, false);
+	set_ga106_opt_in(true);
+	run();
+	assert(fake.started == 1 && fake.unlocks[0] && !fake.unlocks[1]);
+	assert(logged("no eligible GPU at \"all\""));
+	puts("mixed all token never expands to unlisted GA106 cards PASS");
+
+	reset("all,0000:02:00.0");
+	add("0000:01:00.0", 0x2504, false);
+	set_ga106_opt_in(true);
+	run();
+	assert(!fake.loads && !fake.started);
+	puts("mixed all token with unmatched BDF selects nothing PASS");
+
+	reset("0001:0A:00.0");
+	add("0001:0a:00.0", 0x2504, false);
+	set_ga106_opt_in(true);
+	run();
+	assert(fake.started == 1 && fake.unlocks[0]);
+	puts("full nonzero-domain BDF with case-insensitive hex PASS");
 	return 0;
 }

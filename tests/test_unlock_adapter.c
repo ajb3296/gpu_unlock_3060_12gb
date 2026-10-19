@@ -9,6 +9,7 @@ static u32 regs[0x900000/4];
 static const char *asset_root;
 static struct unlock_transaction_work *last_work;
 static bool full_active;
+static bool full_ga106;
 static void check_published_image(void);
 static void check_restored_signature(void);
 static struct {
@@ -17,6 +18,7 @@ static struct {
     int allocs,live,frees,fail_alloc,fail_mask,flrs,fail_reset,starts,boot_mode,bar_bad,barriers,writes;
     int gsp_starts,fwsec_mode,master_fail,selector_writes,ss1_writes,fw_live;
     int pending,lost_identity,corrupt_selector,alien_wpr;
+    u32 identity_override;
     int fw_requests,fail_fw,fail_claim,fail_map,fail_save,fail_context,pins,selector_bad;
     int restore_mask_fail,late_devres;
     int group_requests,fail_group,group_live,group_before,cache_records,cache_released;
@@ -45,7 +47,8 @@ static u8 fw_image[4097];
 static struct firmware fw={sizeof(fw_image),fw_image};
 static void setup(struct unlock_transaction_work *w) {
     memset(&fake,0,sizeof(fake)); memset(regs,0,sizeof(regs)); memset(w,0,sizeof(*w));
-    mask=0xffffffffffffull; dev=(struct pci_dev){.dev={.dma_mask=&mask,.coherent_dma_mask=0xfffffffffull},.refs=1};
+    mask=0xffffffffffffull; dev=(struct pci_dev){.dev={.dma_mask=&mask,.coherent_dma_mask=0xfffffffffull},.refs=1,
+        .vendor=0x10de,.device=0x2204,.revision=0xa1};
     w->pdev=&dev; w->bar=regs; w->bar_len=sizeof(regs); w->mapped=true;
     fake.cmd=2;fake.saved=2;regs[(SEC2_BASE+0xf4)/4]=1u<<31;regs[(0x110000+0xf4)/4]=1u<<31;
     regs[(SEC2_BASE+0x118)/4]=2;regs[(0x110000+0x118)/4]=2;
@@ -163,7 +166,8 @@ void release_firmware(const struct firmware *f) {if(f){free((void *)f->data);fre
 void __module_get(void *p) {fake.pins++;}
 int pci_read_config_word(struct pci_dev *p,int r,u16 *v) {*v=r==PCI_COMMAND?fake.cmd:r==PCI_VENDOR_ID?0x10de:0;return 0;}
 int pci_read_config_dword(struct pci_dev *p,int r,u32 *v) {
-    *v=r==PCI_VENDOR_ID?(fake.flrs && fake.lost_identity?~0u:0x220410de):(u32)fake.bar_bad;return 0;
+    *v=r==PCI_VENDOR_ID?(fake.flrs && fake.lost_identity?~0u:
+        fake.identity_override?fake.identity_override:((u32)p->device<<16)|p->vendor):(u32)fake.bar_bad;return 0;
 }
 int pci_write_config_word(struct pci_dev *p,int r,u16 v) {assert(r==PCI_COMMAND);fake.cmd=v;return 0;}
 int pcie_capability_read_word(struct pci_dev *p,int r,u16 *v) {*v=r==PCI_EXP_DEVSTA?fake.pending:0;return 0;}
@@ -231,9 +235,10 @@ static void check_published_image(void) {
     assert(get64(meta)==GU_WPR_META_MAGIC && get64(meta+8)==1);
     assert(get64(meta+72)==w->v67_dma && get64(meta+80)==GU_V67_SIZE);
     assert(!memcmp(w->v67_cpu,w->v67_fw->data,GU_V67_SIZE));
-    assert(get64(meta+112)==0x5f5400000ull && get64(meta+136)==0x5fada0000ull);
-    assert(get64(meta+144)==0x5ffdfa000ull && get64(meta+152)==0x5ffe00000ull);
-    assert(get64(meta+168)==0x5fff00000ull && get64(meta+176)==0x600000000ull);
+    const u64 delta=full_ga106?(12ull<<30):0;
+    assert(get64(meta+112)==0x5f5400000ull-delta && get64(meta+136)==0x5fada0000ull-delta);
+    assert(get64(meta+144)==0x5ffdfa000ull-delta && get64(meta+152)==0x5ffe00000ull-delta);
+    assert(get64(meta+168)==0x5fff00000ull-delta && get64(meta+176)==0x600000000ull-delta);
     /* Independently walk the radix the way a firmware consumer does. Compare
      * every published image byte, including transitions across 512-entry tables. */
     u64 image_bytes=get64(meta+24);assert(image_bytes==84226048);
@@ -500,6 +505,34 @@ int main(int argc, char **argv) {
         if(mode==2)assert(ret==-ENODEV);
         if(mode==3)assert(ret==-EIO);
     }
+    /* A GA106 identity must survive every PCI check, not masquerade as 3090. */
+    setup(&w);dev.device=0x2504;
+    w.master=w.firmware_started=w.published=true;w.plm_entry=0x8f;
+    w.booter_hdr=(struct gpu_unlock_booter_hdr){.app_code_off=256,.app_code_size=256,
+        .os_data_off=512,.os_data_size=256,.patch_loc=512,.engine_id=1,.ucode_id=3};
+    w.booter_dma=0x100000;w.meta_dma=0x200000;
+    assert(!unlock_transaction_boot(&w));
+    regs[GU_GFW_PLM_OFFSET/4]=1;regs[GU_GFW_BOOT_OFFSET/4]=0xff;
+    regs[GU_GFW_CPUCTL_OFFSET/4]=0x10;
+    assert(!wait_post_flr_gfw(&w));
+    w.signature_calls=2;regs[GU_FEAT_SS1_OFFSET/4]=0x8;
+    assert(!unlock_transaction_reset(&w) && w.quiesced && fake.flrs==1);
+    puts("GA106 PCI identity through Booter, GFW and FLR PASS");
+    for(int checkpoint=0;checkpoint<3;checkpoint++) {
+        setup(&w);dev.device=0x2504;
+        fake.identity_override=0x220410de; /* A readable WRONG identity, not all ones. */
+        w.master=w.firmware_started=w.published=true;w.plm_entry=0x8f;
+        w.booter_hdr=(struct gpu_unlock_booter_hdr){.app_code_off=256,.app_code_size=256,
+            .os_data_off=512,.os_data_size=256,.patch_loc=512,.engine_id=1,.ucode_id=3};
+        w.booter_dma=0x100000;w.meta_dma=0x200000;
+        regs[GU_GFW_PLM_OFFSET/4]=1;regs[GU_GFW_BOOT_OFFSET/4]=0xff;
+        regs[GU_GFW_CPUCTL_OFFSET/4]=0x10;
+        w.signature_calls=2;regs[GU_FEAT_SS1_OFFSET/4]=0x8;
+        int ret=checkpoint==0?unlock_transaction_boot(&w):
+                checkpoint==1?wait_post_flr_gfw(&w):unlock_transaction_reset(&w);
+        assert(ret==-ENODEV && !w.quiesced);
+    }
+    puts("GA106 identity mismatch rejected at all three checkpoints PASS");
     /* Failed FLR/reset/BAR checks retain allocations; success excludes fetches. */
     for(int failure=0;failure<10;failure++) {
         setup(&w);w.firmware_started=true;w.original_cmd=2;w.cmd_valid=true;
@@ -533,6 +566,8 @@ int main(int argc, char **argv) {
     if(argc==3) {
         asset_root=argv[2];
         full_active=true;
+        const char *ga106_flag=getenv("GPU_UNLOCK_TEST_GA106");
+        full_ga106=ga106_flag && !strcmp(ga106_flag,"1");
         static const char *cases[]={"success","already-full","context-oom","asset-1","asset-2",
             "asset-3","asset-4","asset-5","claim-busy","map-failed","save-failed",
             "dma-1","dma-6","dma-7","dma-8","dma-48","dma-last",
@@ -549,16 +584,20 @@ int main(int argc, char **argv) {
         for(unsigned scenario=0;scenario<ARRAY_SIZE(cases);scenario++) {
             setup(&w);
             load_rom(argv[1]);
-            regs[0x1183a4/4]=0x6000;regs[0x625f04/4]=1;regs[0x1fa7c8/4]=0x45cb8f;
-            regs[0x1fa82c/4]=0x100000;regs[0x1fa830/4]=0x5cffff0;
+            /* Synthetic 12-GiB GA106 inputs are not a measured cold ROM dump. */
+            const u64 delta=full_ga106?(12ull<<30):0;
+            if(full_ga106){dev.device=0x2504;regs[0]=0x176000a1;}
+            regs[0x1183a4/4]=full_ga106?0x3000:0x6000;
+            regs[0x625f04/4]=1;regs[0x1fa7c8/4]=0x45cb8f;
+            regs[0x1fa82c/4]=0x100000;regs[0x1fa830/4]=0x5cffff0-(u32)(delta>>8);
             regs[GU_GFW_PLM_OFFSET/4]=1;regs[GU_GFW_BOOT_OFFSET/4]=0xff;
             regs[GU_GFW_CPUCTL_OFFSET/4]=0x10;
-            /* Cold values captured from the Palit card at 0000:21:00.0. */
+            /* Original 3090 samples; GA106 uses synthetic values, not measurements. */
             regs[GU_FEAT_PLM_OFFSET/4]=0xffffff8f;regs[GU_FEAT_SS0_OFFSET/4]=0x40171022;
             regs[GU_FEAT_SS1_OFFSET/4]=0x2;
             fake.fwsec_wpr=1;
-            fake.fwsec_wpr_lo=(u32)(0x5ffe00000ull>>12)<<4;
-            fake.fwsec_wpr_hi=(u32)(0x5ffeff000ull>>12)<<4;
+            fake.fwsec_wpr_lo=(u32)((0x5ffe00000ull-delta)>>12)<<4;
+            fake.fwsec_wpr_hi=(u32)((0x5ffeff000ull-delta)>>12)<<4;
             regs[(GU_FUSE_SEC2_UCODE1+2*4)/4]=1;
             /* FWSEC fuse: the real board ROM needs version 1, the fixture 0. */
             if(strcmp(argv[1],"-"))regs[(0x8241c0+8*4)/4]=1;
@@ -665,7 +704,8 @@ int main(int argc, char **argv) {
             }
             printf("full transaction %s: error=%d retained=%u PASS\n",cases[scenario],ret,retained);
         }
-        puts("pinned firmware full BF16 transactions passed under mocked hardware");
+        printf("%s pinned firmware transactions passed under MOCKED hardware\n",
+               full_ga106?"GA106 synthetic 12-GiB":"GA102 24-GiB");
     }
     puts("actual unlock_transaction radix, early-PLM and reset/retention checks passed");
 }

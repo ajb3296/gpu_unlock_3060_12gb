@@ -11,7 +11,10 @@
 
 #define __init
 #define __exit
-#define module_param(name, type, perm)
+void test_register_parameter(const char *, void *);
+#define module_param(name, type, perm) \
+    static void __attribute__((constructor)) register_##name(void) \
+    { test_register_parameter(#name, &name); }
 #define MODULE_PARM_DESC(name, desc)
 #define MODULE_LICENSE(x)
 #define MODULE_DESCRIPTION(x)
@@ -21,9 +24,11 @@
 #define module_exit(fn) void (*test_module_exit)(void) = fn;
 
 #define PCI_VENDOR_ID_NVIDIA 0x10de
+#define PCI_ANY_ID (~0u)
 struct pci_dev {
 	const char *name;
 	unsigned short vendor, device;
+	unsigned char revision;
 	void *driver;
 	int refs;
 	pthread_mutex_t lock;

@@ -1,4 +1,71 @@
-# GPU unlock 1.0.0 packaging candidate
+# GPU unlock — experimental RTX 3060 GA106 port
+
+**Status: source-port candidate, NOT hardware-validated. Do not treat a successful
+build or mocked transaction as proof that an RTX 3060 unlocks or becomes faster.**
+
+This local fork is based on upstream commit
+`0ebdb1c6308b6a2072be5bf04513472942541956`. It adds an explicitly gated path
+for the observed desktop RTX 3060 LHR PCI identity `10de:2504`, revision `a1`.
+The observed board has 12,288 MiB VRAM and runs NVIDIA `580.178.04` on
+Linux `7.0.0-38-generic`. These are inventory readings, not unlock results.
+
+## Changes and safety gates
+
+- `gpu_unlock.experimental_ga106=1` is an additional, default-off opt-in.
+- A GA106 target must have an explicit full PCI address in `gpu_unlock.targets=`.
+  `targets=all` continues to select RTX 3090 only, even when the GA106 opt-in is on.
+- Other 3060 device IDs, the GA104-based 3060, laptop variants and revisions other
+  than `a1` are not enabled. PCI identity/revision alone does not distinguish VRAM
+  capacities; only the observed 12-GiB board is this port's intended test target.
+- The Booter, post-FLR GFW and post-FLR PCI checks compare the card's original
+  vendor/device identity rather than pretending every card is `10de:2204`.
+- Existing bound-driver, cold-state, DMA, firmware-geometry, reservation and FLR
+  guards remain in place. There is no driver unload or live-unlock helper.
+
+No new GA106 firmware image is invented. NVIDIA's **610.43.03** generated
+`g_kernel_gsp_nvoc.c` maps GA106 and GA102 to the same
+`kgspGetBinArchiveBooterLoadUcode_GA102` (lines 1646–1648) and
+`kgspGetBinArchiveGspRmBoot_GA102` (lines 833–835), and to the same WPR metadata
+routine (lines 1044–1046). This supports testing the common loader assets; it
+**does not prove** that the V67 payload, selector semantics, board fuses or the
+handoff to installed driver 580 work on the user's card.
+
+Official source reference:
+https://github.com/NVIDIA/open-gpu-kernel-modules/blob/610.43.03/src/nvidia/generated/g_kernel_gsp_nvoc.c
+
+The pinned 610.43.03 inputs and V67 payload are unchanged. SS1's effect remains
+untested, as in upstream. No throughput or numerical-correctness claim is made.
+
+## Build and host verification only
+
+```sh
+# Does not load or install the module:
+make -C /lib/modules/$(uname -r)/build M="$PWD/kernel/gpu_unlock" modules
+python3 -m unittest discover -s tests -v
+# Set GPU_UNLOCK_ASSETS to the generated asset directory to also exercise
+# pinned-asset transactions for GA102 and a SYNTHETIC 12-GiB GA106 fixture.
+```
+
+The tests use mock PCI/MMIO/DMA and a synthetic ROM. The GA106 fixture is not a
+ROM or register dump taken from the live 3060. Both success and failure paths
+are exercised; these tests cannot establish physical execution or performance.
+The native packages below build committed `HEAD`, so commit a reviewed port
+before using their packaging targets. Packaging version remains upstream 1.0.0.
+
+## Hardware validation is a separate operation
+
+**This work did not install packages, load `gpu_unlock`, write GPU registers,
+change initramfs/boot arguments, change the NVIDIA driver, or reboot.**
+Before any future hardware trial, arrange physical access and a recoverable boot
+entry. The experimental opt-in and an explicit BDF would both be necessary;
+never unload a live display/compute driver merely to force an attempt. A full
+power-off, cold-state verification, board-specific firmware/fuse checks, stock
+NVIDIA handoff, CUDA numerical checks and controlled before/after benchmarks
+remain unperformed. The currently installed 580 driver is not a validated
+combination with this 610.43.03 unlock path.
+
+## Upstream 1.0.0 packaging candidate notes
+
 
 This Linux kernel module combines the CMP unlocker's V67/PLM technique with the
 pre-driver timing of the UEFI approach. It runs the unlock, writes
@@ -65,7 +132,10 @@ gpu_unlock.targets=0000:21:00.0,0000:22:00.0    # comma-separated
 
 Addresses are full PCI names as `lspci -D` prints them (hex digits in either
 case), independent of GPU numbering and display role. An entry that is not
-an RTX 3090, including `all` mixed with addresses, is logged and ignored.
+an RTX 3090 or an explicitly opted-in eligible experimental GA106 target is
+logged and ignored. An `all` token mixed with addresses is ignored; it does
+not expand to other cards, while separately listed eligible addresses remain
+eligible. Use `all` alone only for RTX 3090 cards.
 The cards are unlocked concurrently, about a second in all however many
 there are, and each on its own: a card that is already bound, powered down
 or bus mastering is skipped. Then `nvidia` loads and binds every card as
