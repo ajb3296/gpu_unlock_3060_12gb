@@ -1,193 +1,221 @@
-# GPU unlock — experimental RTX 3060 GA106 port
+# GPU 언락 — RTX 3060 12GB GA106 실험적 포트
 
-**Status: source-port candidate, NOT hardware-validated. Do not treat a successful
-build or mocked transaction as proof that an RTX 3060 unlocks or becomes faster.**
+**2026년 10월 20일, RTX 3060 12GB LHR 실물 카드 한 장에서 펌웨어 실행·언락 후 NVIDIA 드라이버 인계·텐서 연산 성능 상승을 확인했습니다.** 단순 빌드나 모의 테스트 결과가 아니라 실제 GPU에서 얻은 결과입니다. 다만 다른 보드의 호환성, 장시간 안정성, 실제 애플리케이션의 성능 향상을 보장하는 범용 완성품은 아닙니다.
 
-This local fork is based on upstream commit
-`0ebdb1c6308b6a2072be5bf04513472942541956`. It adds an explicitly gated path
-for the observed desktop RTX 3060 LHR PCI identity `10de:2504`, revision `a1`.
-The observed board has 12,288 MiB VRAM and runs NVIDIA `580.178.04` on
-Linux `7.0.0-38-generic`. These are inventory readings, not unlock results.
+이 포트는 `Zagitta/gpu-unlock`의 커밋 `0ebdb1c6308b6a2072be5bf04513472942541956`을 기반으로 합니다. 아래 실기 검증에는 이 저장소의 커밋 **`e58f77a227387614437da6f7fa618b88a7bb94d7`**으로 만든 모듈을 사용했습니다.
 
-## Changes and safety gates
+## 1. 검증 환경
 
-- `gpu_unlock.experimental_ga106=1` is an additional, default-off opt-in.
-- A GA106 target must have an explicit full PCI address in `gpu_unlock.targets=`.
-  `targets=all` continues to select RTX 3090 only, even when the GA106 opt-in is on.
-- Other 3060 device IDs, the GA104-based 3060, laptop variants and revisions other
-  than `a1` are not enabled. PCI identity/revision alone does not distinguish VRAM
-  capacities; only the observed 12-GiB board is this port's intended test target.
-- The Booter, post-FLR GFW and post-FLR PCI checks compare the card's original
-  vendor/device identity rather than pretending every card is `10de:2204`.
-- Existing bound-driver, cold-state, DMA, firmware-geometry, reservation and FLR
-  guards remain in place. There is no driver unload or live-unlock helper.
+- 그래픽카드: NVIDIA RTX 3060 12GB LHR, GA106, `10de:2504`, 리비전 `a1`.
+- VRAM: 12,288 MiB. 시험 당시 PCI 주소: `0000:01:00.0`.
+- CPU / 메인보드: Intel Core i7-6700K / ASRock B150M Pro4.
+- 운영체제 / 커널: Ubuntu 26.04.1 LTS / `7.0.0-38-generic`.
+- NVIDIA 드라이버: **580.178.04**. 비교 시험에서 드라이버를 교체하지 않았습니다.
+- 언락에 사용한 고정 펌웨어 입력: NVIDIA **610.43.03** 계열.
+- 벤치마크: 기존 CUDA 12.8 라이브러리, cuBLAS 12.8.5, 전력 제한 170W.
+- 성공 조건: 내장그래픽을 주 화면으로 설정. Linux에서 내장그래픽 `boot_vga=1`, RTX 3060 `boot_vga=0` 확인.
+- 사용자에게 안내하고 적용한 UEFI 설정: `Advanced → Chipset Configuration → Primary Graphics Adapter = Onboard`, `IGPU Multi-Monitor = Enabled`. 모니터는 메인보드 영상 출력 사용.
+- 실제 사용한 모듈의 SHA-256: `5e8d9e484fed2f3e140987eb4d5258b2637a513f316e07690d0ea4ae7c1a058c`.
 
-No new GA106 firmware image is invented. NVIDIA's **610.43.03** generated
-`g_kernel_gsp_nvoc.c` maps GA106 and GA102 to the same
-`kgspGetBinArchiveBooterLoadUcode_GA102` (lines 1646–1648) and
-`kgspGetBinArchiveGspRmBoot_GA102` (lines 833–835), and to the same WPR metadata
-routine (lines 1044–1046). This supports testing the common loader assets; it
-**does not prove** that the V67 payload, selector semantics, board fuses or the
-handoff to installed driver 580 work on the user's card.
+**검증 범위는 위 카드 한 장과 위 조합입니다.** 모든 GA106, 모든 LHR 카드, 모든 RTX 3060 12GB 또는 다른 드라이버에서도 된다는 의미는 아닙니다.
 
-Official source reference:
-https://github.com/NVIDIA/open-gpu-kernel-modules/blob/610.43.03/src/nvidia/generated/g_kernel_gsp_nvoc.c
+## 2. 실제 성능 비교
 
-The pinned 610.43.03 inputs and V67 payload are unchanged. SS1's effect remains
-untested, as in upstream. No throughput or numerical-correctness claim is made.
+동일한 cuBLAS `cublasGemmEx` 연산·측정 방식으로 비교했습니다. 행렬 크기는 `8192 × 8192 × 8192`, 라운드당 32회, 총 7라운드의 중앙값입니다. FP16/BF16은 FP32 누산·출력을 사용하고, TF32는 명시적인 `FAST_TF32` 계산 모드를 사용했습니다. 희소성 가속을 사용하지 않았습니다.
 
-## FWSEC safety backports
+| 연산 | 적용 전 TFLOPS | 적용 후 TFLOPS | 배율 | 상승률 |
+|---|---:|---:|---:|---:|
+| FP16 입력 / FP32 누산 | 26.893 | 49.873 | 1.854배 | +85.45% |
+| BF16 입력 / FP32 누산 | 26.892 | 50.646 | 1.883배 | +88.33% |
+| TF32 | 13.497 | 26.459 | 1.960배 | +96.03% |
 
-The bounded DMEM block-rounding helper and DMA-exposure tracking fix are adapted
-from `IHaBiS02/ga107-unlock` commit
-`5e6b3600bb01142891d43d62120727e96911d1a6` (GPL-2.0-only).
-DMEM transfers round up to whole 256-byte blocks only when the existing image
-contains the complete transfer; overflow, misalignment and range violations fail
-closed. Buffers become potentially firmware-visible immediately before DMA
-source/base programming, not before geometry or initial-queue checks. Failures
-after possible DMA exposure still retain resources unless quiescence is proven.
+측정 조건과 한계:
 
-Regressions cover partial DMEM, pre-DMA cleanup, post-DMA retention and the
-unchanged initial-BME rejection in both GA102 and synthetic 12-GiB GA106 profiles.
-These changes do **not** normalize initial Bus Master state or change SS0/SS1
-policy. They are source/build changes only, not installation into the running
-kernel or the previously created trial initramfs. Updating that image and any
-physical trial require a separate operation. Falcon destination encoding checks
-also do not establish the physical IMEM/DMEM capacity of an unfamiliar engine.
+- 연산 코드, 행렬 크기, 반복 횟수, 라이브러리 버전, 관련 환경변수, NVIDIA 드라이버와 전력 제한이 일치하는 것을 확인했습니다.
+- 적용 전 전용 측정기는 그대로 보존했습니다. 적용 후 측정본은 실행 상태 검사와 결과의 단계 표기만 변경했으며, 연산·측정 부분이 동일한지 회귀 테스트했습니다.
+- 입력은 모두 1인 행렬이며, 각 자료형에서 출력 앞 16개 값이 기대값 `8192`인지 검사해 통과했습니다. **전체 출력 또는 다양한 입력에 대한 포괄적 수치 정확성 검증은 아닙니다.**
+- 적용 전에는 외장그래픽이 화면을 담당했고, 적용 후에는 내장그래픽이 화면을 담당했습니다. 클럭과 온도도 고정하지 않았으므로, 표시한 상승률은 이 두 조건에서 관측한 비교값입니다.
+- 벤치마크 후 확인한 커널 로그에는 NVIDIA Xid 오류가 없었고, 측정 프로그램 종료 후 GPU 메모리 사용량은 12 MiB로 돌아왔습니다.
+- **GEMM 처리량이 약 두 배에 가까워졌다는 결과이지, ComfyUI·게임·모든 AI 작업이 같은 비율로 빨라진다는 뜻은 아닙니다.** 장시간 안정성도 아직 검증하지 않았습니다.
 
-## Build and host verification only
+## 3. 초기 실패 원인과 해결 과정
 
-```sh
-# Does not load or install the module:
-make -C /lib/modules/$(uname -r)/build M="$PWD/kernel/gpu_unlock" modules
-python3 -m unittest discover -s tests -v
-# Set GPU_UNLOCK_ASSETS to the generated asset directory to also exercise
-# pinned-asset transactions for GA102 and a SYNTHETIC 12-GiB GA106 fixture.
+### 3.1 처음에는 언락 펌웨어 실행 전 BME 검사에서 중단
+
+외장그래픽이 주 화면이던 시험에서 PCI Command는 다음과 같았습니다.
+
+- GRUB 진단 항목 진입: `0x7`.
+- GRUB의 커널·initrd 적재 후 Linux 인계 직전: `0x7`.
+- Linux 초기 PCI 열거의 `pci=earlydump`: `0x7`.
+- 언락 모듈 진입 검사: `0x7`, `PCI_COMMAND_MASTER` 비트가 설정된 상태.
+
+`kernel/gpu_unlock/unlock_610.c`의 `unlock_transaction_claim()`은 초기 BME가 켜져 있으면 `-EBUSY`를 반환합니다. 실제 실패 로그는 다음과 같습니다.
+
+```text
+unlock_transaction_claim error=-16
+last PCI sample: capability=0 offset=0x4 value=0x7 result=0
+firmware_started=0
+gpu_unlock: unlock failed (-16)
 ```
 
-The tests use mock PCI/MMIO/DMA and a synthetic ROM. The GA106 fixture is not a
-ROM or register dump taken from the live 3060. Both success and failure paths
-are exercised; these tests cannot establish physical execution or performance.
-The native packages below build committed `HEAD`, so commit a reviewed port
-before using their packaging targets. Packaging version remains upstream 1.0.0.
+즉, **초기 진입 조건이 맞지 않아 중단된 것이며, V67 펌웨어 실행 실패·LHR 차단·후속 WPR 검사 실패로 판정할 상황이 아니었습니다.** 모듈은 NVIDIA보다 먼저 실행됐지만 이미 BME가 켜져 있었습니다. GRUB에서도 켜져 있었으므로, 해당 부팅에서 Linux NVIDIA 드라이버가 처음 켰다는 설명은 맞지 않았습니다.
 
-## Hardware validation is a separate operation
+사용자가 AC 전원을 분리한 뒤 켠 시험에서도 같은 결과였습니다. 그때 UEFI 기본값 로드 메시지도 보고됐습니다. 전지 방전은 사용자 추정이며 별도로 확인하지 않았고, UEFI 설정이 유지된 전원 분리 대조 시험으로 볼 수는 없습니다. **전원 분리만으로 다음 부팅의 초기 BME 상태가 보장되지는 않았습니다.**
 
-**This work did not install packages, load `gpu_unlock`, write GPU registers,
-change initramfs/boot arguments, change the NVIDIA driver, or reboot.**
-Before any future hardware trial, arrange physical access and a recoverable boot
-entry. The experimental opt-in and an explicit BDF would both be necessary;
-never unload a live display/compute driver merely to force an attempt. A full
-power-off, cold-state verification, board-specific firmware/fuse checks, stock
-NVIDIA handoff, CUDA numerical checks and controlled before/after benchmarks
-remain unperformed. The currently installed 580 driver is not a validated
-combination with this 610.43.03 unlock path.
+### 3.2 내장그래픽을 주 화면으로 바꾼 후 초기 상태가 달라짐
 
-## Upstream 1.0.0 packaging candidate notes
+UEFI에서 내장그래픽을 주 화면으로 지정한 뒤, 같은 검증 모듈을 별도 initramfs의 1회 부팅 항목으로 실행했습니다. **BME를 강제로 끄는 코드를 추가하거나 기존 거부 검사를 삭제하지 않았습니다.**
 
+- 내장그래픽 `0000:00:02.0`: `boot_vga=1`.
+- RTX 3060 `0000:01:00.0`: `boot_vga=0`.
+- GRUB 진입 / Linux 인계 직전 / Linux 초기 PCI 읽기: 모두 **`0x0`**.
+- 모듈 진입: `claim: command=0x0`으로 기존 BME 검사를 통과.
 
-This Linux kernel module combines the CMP unlocker's V67/PLM technique with the
-pre-driver timing of the UEFI approach. It runs the unlock, writes
-the speed selectors (SS0 `0x88888888`, which selects the full BF16 rate, and
-the 4-bit SS1 `0x8`, whose effect is untested) and performs FLR before the unmodified
-NVIDIA driver binds the card.
-It is neither a UEFI application nor a patched NVIDIA driver.
+이후 FWSEC 실행, 선택자 설정, FLR, 후속 검사와 정리가 진행됐습니다. 실제 로그의 주요 부분은 다음과 같습니다.
 
-The observed result is GPU1, an RTX 3090 at `0000:21:00.0`, on the main
-CachyOS `7.2.8-1-cachyos` kernel with NVIDIA `615.71.09`. GPU0 at
-`0000:01:00.0` was an unmodified control. Other RTX 3090 boards and
-environments have not been verified. Other GA102 PCI device IDs are rejected.
+```text
+claim: command=0x0 capability=0x112c8de1 BAR_mask=0x4b
+pre-FLR selectors: ss0=0x88888888 expected=0x88888888 ss1=0x8 expected=0x8
+PCIe FLR returned: result=0
+post-FLR SEC2 reset released, GSP halted, BME=0 pending=0 WPR2=1ffffe00:00000000 SS0=88888888 SS1=00000008
+restore PCI command: actual=0x0 original=0x0 mask=0x6
+gpu_unlock: unlocked
+```
 
-## Local build
+그 뒤 NVIDIA 580.178.04가 정상 로드됐고, 위의 실제 CUDA 성능 향상까지 확인했습니다. 진단값은 실제 커널 명령행의 식별값, 변경된 부팅 ID, 재예약 전 이전 관측값 삭제, 정확한 PCI 식별값과 함께 확인했습니다. 저장된 과거 GRUB 값을 새 결과로 오인한 것이 아닙니다.
 
-Every build downloads the pinned NVIDIA/CachyOS inputs over HTTPS, checks
-their SHA-256, and generates firmware only in the build directory and the
-binary package. All three formats install through the same `make install-*`
-targets. Packages are built from the committed `HEAD`.
+### 3.3 확인된 사실과 아직 남은 가설
 
-Build, install build dependencies, and install the packages in one step
-(asks for your sudo password):
+**확인된 직접 실패 원인:** 초기 BME ON 상태에 대한 모듈의 안전 검사였습니다. **이번 환경에서는 내장그래픽을 주 화면으로 바꾼 후 이 진입 차단이 해소됐고 실제 언락·성능 상승으로 이어졌습니다.**
+
+부팅 화면을 담당하는 GPU의 UEFI/GOP 초기화 경로가 차이를 만들었다는 해석을 강하게 뒷받침합니다. 다만 **GOP 드라이버의 특정 명령이 BME를 설정했다고 추적한 것은 아닙니다.** 보드 펌웨어, GOP, 더 이른 부트로더 초기화 중 정확한 설정 주체는 구분하지 못했습니다. 따라서 이를 단정적인 ‘GOP 버그’로 기록하지 않습니다.
+
+이 결과는 초기 BME 강제 해제의 안전성을 입증하지도 않습니다. 프레임버퍼 제거는 GPU 전체 DMA 정지와 동의어가 아니며, 초기 BME 검사·cold-state 검사·DMA 수명 보호는 그대로 유지했습니다.
+
+## 4. 실기 검증의 범위와 안전 주의사항
+
+- **실제 검증 완료:** 이 카드에서 펌웨어 경로 실행, FLR 후 목표 선택자 유지, 정상 NVIDIA 인계, 제한된 출력 샘플 검사와 GEMM 성능 비교.
+- **미검증:** 다른 카드·보드·펌웨어·드라이버, 장시간 안정성, 다양한 입력의 전체 수치 검증, 실제 앱의 향상률, SS1만의 독립적 효과, 매 부팅 반복 재현성.
+- 성공한 시험은 사용자가 ‘재부팅’으로 보고했습니다. 그 사실만으로 모든 warm reboot를 지원하거나, 별도 AC 분리 성공 시험을 완료했다고 주장하지 않습니다. 모듈의 실제 cold-state 검사를 통과하는지가 중요하며, 이미 초기화된 카드는 거부될 수 있습니다.
+- 물리적 접근과 정상 Ubuntu 복구 항목을 확보하고 시험하십시오. GPU 정지나 화면 소실이 가능하며, 실패 시 전원을 완전히 꺼야 할 수 있습니다.
+- 실행 중인 NVIDIA 드라이버를 강제로 내리거나, BME 거부 검사·장치 식별·메모리 보호 검사를 삭제해 진입을 강제하지 마십시오.
+- 시험에서는 정상 커널·정상 initramfs·기본 부팅을 보존하고 별도 이미지와 1회 항목을 사용했습니다. 모듈이 udev/NVIDIA보다 먼저 실행되도록 실제 이미지의 순서와 내장된 모든 자산의 해시를 확인했습니다.
+- **이 저장소의 문서 수정이 상시 자동 적용을 설정하지는 않습니다.** 검증 당시에도 1회 부팅을 사용했으며, 다음 일반 부팅에서 모듈이 자동 재실행된다고 가정하면 안 됩니다.
+- AC를 분리하려면 운영체제가 완전히 종료된 다음에 하십시오. UEFI 설정이 초기화되는 시스템에서는 주 그래픽 설정이 유지됐는지 먼저 확인하십시오.
+
+## 5. GA106 포트의 선택 조건과 안전 검사
+
+- `gpu_unlock.experimental_ga106=1`은 기본값이 꺼진 별도의 실험 참여 옵션입니다.
+- GA106은 `gpu_unlock.targets=`에 정확한 전체 PCI 주소를 명시해야 합니다.
+- `targets=all`은 실험 옵션을 켜도 기존 RTX 3090만 선택합니다.
+- 다른 RTX 3060 장치 ID, GA104 기반 3060, 노트북 변형과 `a1` 이외 리비전은 활성화하지 않았습니다. PCI ID·리비전만으로 VRAM 용량을 구분할 수 없으므로, 이 포트의 실기 검증 범위는 위 12GB 카드 한 장입니다.
+- Booter, FLR 후 GFW와 PCI 검사는 모든 카드를 `10de:2204`로 간주하지 않고 원래 저장한 vendor/device를 비교합니다.
+- 이미 연결된 드라이버, 초기 BME, cold-state, DMA 수명, 펌웨어 크기·정렬, 예약 메모리와 FLR 검사를 유지합니다. 실행 중인 드라이버를 내리는 도구는 없습니다.
+
+시험에 사용한 GA106 명령행 옵션은 다음과 같습니다. **이 문자열만 추가한다고 올바른 initramfs 순서나 안전한 시험 환경이 구성되는 것은 아닙니다.**
+
+```text
+gpu_unlock.targets=0000:01:00.0 gpu_unlock.experimental_ga106=1
+```
+
+## 6. 공통 펌웨어 입력과 FWSEC 안전성 수정
+
+GA106 전용 펌웨어를 임의로 만들지 않았습니다. NVIDIA 610.43.03의 `g_kernel_gsp_nvoc.c`에서 GA106과 GA102는 같은 `kgspGetBinArchiveBooterLoadUcode_GA102`, `kgspGetBinArchiveGspRmBoot_GA102`와 WPR 메타데이터 루틴을 사용합니다. 이 공통성은 초기 포팅 근거였으며, 실제 호환성 판단은 위 실기 결과와 구분합니다.
+
+원본 확인 경로:
+
+```text
+NVIDIA/open-gpu-kernel-modules
+610.43.03/src/nvidia/generated/g_kernel_gsp_nvoc.c
+```
+
+고정된 610.43.03 입력과 V67 페이로드는 유지했습니다. `IHaBiS02/ga107-unlock` 커밋 `5e6b3600bb01142891d43d62120727e96911d1a6`에서 제한된 DMEM 블록 올림과 DMA 노출 추적 수정을 가져왔습니다. 해당 코드는 GPL-2.0-only입니다.
+
+- DMEM 전송 크기는 기존 이미지에 완전한 전송 범위가 있을 때만 256바이트 단위로 올립니다. 오버플로·정렬·범위 위반은 거부합니다.
+- DMA 소스·베이스를 프로그래밍하기 직전에 버퍼가 펌웨어에 노출될 수 있다고 기록합니다. 형상 검사나 초기 큐 검사 전부터 노출됐다고 간주하지 않습니다.
+- 노출 이후 실패하면 안전한 정지가 확인되지 않는 한 관련 자원을 보존합니다.
+- 이 변경은 초기 BME를 정규화하거나 SS0/SS1 정책을 바꾸지 않습니다. 이번 검증 이미지에는 수정본 모듈이 실제 포함됐으며 해시로 확인했습니다.
+
+## 7. 빌드와 호스트 모의 테스트
+
+아래 커널 빌드는 모듈을 설치하거나 로드하지 않습니다.
 
 ```sh
+make -C /lib/modules/$(uname -r)/build M="$PWD/kernel/gpu_unlock" modules
+python3 -m unittest discover -s tests -v
+```
+
+`GPU_UNLOCK_ASSETS`에 생성된 자산 디렉터리를 지정하면 GA102와 **합성 12GiB GA106 시험 데이터**의 고정 자산 트랜잭션도 검사할 수 있습니다. 테스트의 PCI/MMIO/DMA와 ROM은 모의 데이터입니다. 실물 3060에서 읽어온 ROM·레지스터라고 해석하면 안 됩니다. 호스트 테스트와 위 실기 검증은 서로 다른 검증 단계입니다.
+
+네이티브 패키지는 커밋된 `HEAD`를 사용합니다. 패키징 전에 검토된 소스가 커밋돼 있어야 합니다. 패키지 버전은 상위 프로젝트의 `1.0.0`을 유지합니다.
+
+## 8. 패키지 생성과 설치
+
+**다음 설치 명령은 운영체제의 모듈·initramfs 구성을 변경합니다. 빌드만 하는 명령과 구분하십시오.** 위 실기 검증은 아래 범용 설치 절차 전체가 아니라, 별도로 검증한 1회 시험 이미지에서 수행했습니다.
+
+빌드는 고정된 NVIDIA/CachyOS 입력을 HTTPS로 내려받아 SHA-256을 검증하고, 빌드 디렉터리와 바이너리 패키지에만 펌웨어를 생성합니다. 커밋된 `HEAD`가 패키징 대상입니다.
+
+```sh
+# 의존성 준비·빌드·설치를 진행하며 관리자 인증이 필요합니다.
 make install-arch   # makepkg -sif
 make install-deb    # apt-get build-dep, dpkg-buildpackage, apt-get install
 make install-rpm    # dnf builddep, rpmbuild, dnf install
+
+# 설치하지 않고 빌드만 합니다.
+make arch
+make deb
+make rpm
 ```
 
-`make arch`, `make deb` and `make rpm` only build. Debian and RPM packages go
-to `build/deb` and `build/rpm`. The NVIDIA inputs are cached in
-`~/.cache/gpu-unlock/inputs` (`make inputs`; override with `INPUTS=`).
-`dpkg-buildpackage` itself never uses the network, so a clean-chroot build (sbuild or
-pbuilder) needs `GPU_UNLOCK_INPUTS` pointing at that cache.
-The `make dist` archive, the Debian source package and the `.nosrc.rpm`
-contain no NVIDIA archives or generated firmware.
+Debian/RPM 결과는 `build/deb`, `build/rpm`에 생성됩니다. 입력은 기본적으로 `~/.cache/gpu-unlock/inputs`에 캐시합니다. `make inputs` 또는 `INPUTS=`로 준비 경로를 지정할 수 있습니다. `dpkg-buildpackage` 자체는 네트워크를 사용하지 않으므로, 격리 빌드에는 `GPU_UNLOCK_INPUTS`로 준비된 캐시를 전달해야 합니다.
 
-## Boot flow and opt-in
+`make dist`, Debian 소스 패키지와 `.nosrc.rpm`에는 NVIDIA 아카이브나 생성 펌웨어가 포함되지 않습니다. 펌웨어 생성 과정은 [firmware/README.md](firmware/README.md)를 참고하십시오.
 
-The packages put `gpu_unlock` and its firmware in the initramfs and load it
-there, before `nvidia` can bind a card:
+## 9. 부팅 순서와 실행 옵션
 
-- **mkinitcpio:** `/etc/mkinitcpio.conf.d/zz-gpu-unlock.conf` inserts
-  `gpu_unlock` right before `nvidia` in `MODULES`, so a display card is blank
-  for as short a time as possible. Without `nvidia` in the image, it goes
-  last and still runs before an `nvidia` loaded from the root filesystem.
-  Images are rebuilt on install. mkinitcpio ignores drop-ins for an image
-  built with `-c <config>` or a preset `_config`; put `gpu_unlock` right
-  before `nvidia` in that config's `MODULES` yourself.
-- **initramfs-tools:** `/usr/share/initramfs-tools/modules.d/gpu-unlock.conf`.
-- **dracut:** `/usr/lib/dracut/dracut.conf.d/gpu-unlock.conf`.
+상위 패키징은 initramfs에 모듈과 펌웨어를 넣습니다.
 
-There is no `softdep nvidia pre:` rule: kmod honours only the first
-`softdep nvidia` line it reads, so other packages' rules (`nvidia-utils`,
-`gddr6_hwmon`) would silently override it, or it would override theirs.
+- **mkinitcpio:** `/etc/mkinitcpio.conf.d/zz-gpu-unlock.conf`에서 `MODULES`의 `nvidia` 직전에 `gpu_unlock`을 넣습니다. 이미지에 `nvidia`가 없으면 목록 끝에 넣습니다. `-c <config>` 또는 프리셋의 `_config`를 사용하는 경우에는 해당 설정의 `MODULES`를 직접 확인해야 합니다.
+- **initramfs-tools:** `/usr/share/initramfs-tools/modules.d/gpu-unlock.conf`를 사용합니다. **파일 존재만으로 udev보다 먼저 실행된다고 보장하지 마십시오.** 실기 시험에서는 직접 `insmod`를 호출하는 별도 초기 스크립트와 생성된 `ORDER`를 확인했습니다.
+- **dracut:** `/usr/lib/dracut/dracut.conf.d/gpu-unlock.conf`를 사용합니다.
 
-The module does nothing unless the kernel command line opts in:
+`softdep nvidia pre:` 규칙은 추가하지 않습니다. kmod가 먼저 읽은 같은 이름의 규칙만 적용해 다른 패키지의 `nvidia` 규칙과 충돌할 수 있기 때문입니다.
 
-```
-gpu_unlock.targets=all                          # every unbound 10de:2204 card
-gpu_unlock.targets=0000:21:00.0                 # only these cards
-gpu_unlock.targets=0000:21:00.0,0000:22:00.0    # comma-separated
+RTX 3090용 기존 선택 예시는 다음과 같습니다. GA106은 위의 별도 실험 옵션과 전체 주소가 모두 필요합니다.
+
+```text
+gpu_unlock.targets=all
+gpu_unlock.targets=0000:21:00.0
+gpu_unlock.targets=0000:21:00.0,0000:22:00.0
 ```
 
-Addresses are full PCI names as `lspci -D` prints them (hex digits in either
-case), independent of GPU numbering and display role. An entry that is not
-an RTX 3090 or an explicitly opted-in eligible experimental GA106 target is
-logged and ignored. An `all` token mixed with addresses is ignored; it does
-not expand to other cards, while separately listed eligible addresses remain
-eligible. Use `all` alone only for RTX 3090 cards.
-The cards are unlocked concurrently, about a second in all however many
-there are, and each on its own: a card that is already bound, powered down
-or bus mastering is skipped. Then `nvidia` loads and binds every card as
-usual.
+주소는 `lspci -D`의 전체 PCI 주소이며 GPU 번호와는 별개입니다. `all`과 개별 주소를 혼합하면 `all` 토큰은 무시되고 적격인 개별 주소만 처리합니다. 이미 드라이버가 연결됐거나 전원·BME·cold-state 조건을 만족하지 않는 카드는 거부됩니다. 상위 코드는 여러 적격 카드를 병렬 처리하지만, 이번 GA106 실기 검증은 한 장만 사용했습니다.
 
-The display card works too. Its firmware framebuffer (the boot console and
-Plymouth) keeps running while the unlock's firmware steps run, and is
-removed just before the card's reset, as `nvidia-drm` would do a moment
-later anyway. Its screen is blank from that reset until `nvidia-drm` takes
-over.
+상위 코드에는 디스플레이 카드 처리 경로도 있습니다. 펌웨어 프레임버퍼는 FLR 직전에 제거하고 이후 NVIDIA가 화면을 인계합니다. **이 경로가 있다는 사실은 초기 BME ON 진입을 허용한다는 뜻이 아닙니다.** 이번 보드에서는 내장그래픽을 주 화면으로 바꿔 진입 조건을 만족시켰습니다.
 
-The unlock needs a cold card: power the machine off rather than rebooting.
-Warm reboots are not supported; with the option set, the unlock is expected
-to fail and leave the card as it was. Loading the module by hand after boot
-does nothing to a card that `nvidia` has bound. A card that a driver already
-used this power cycle is refused before any firmware runs (`card already
-initialised since power on`).
-
-Check the result with:
+결과 확인은 읽기 전용 명령으로 시작하십시오.
 
 ```sh
-journalctl -k -b | grep gpu_unlock
-lspci -nnk -s 0000:21:00.0
+journalctl -k -b | grep -E 'gpu_unlock|post-FLR|FWSEC|NVRM'
+lspci -nnk -s 0000:01:00.0
+nvidia-smi
 ```
 
-To stop unlocking, remove `gpu_unlock.targets=` from the kernel command line;
-for a one-off boot, delete it in the bootloader's edit screen. Removing the
-packages also removes the module and the initramfs drop-ins.
+모듈이 로드됐다는 사실만으로 성공으로 판단하지 마십시오. 실제 실행 결과·정리·드라이버 인계와 CUDA 측정을 함께 확인해야 합니다. 펌웨어가 멈추지 않으면 관련 DMA 버퍼를 보존할 수 있으므로 전원을 완전히 끈 뒤 원인을 확인하십시오. 실행을 중단하려면 부팅 명령행의 참여 옵션을 제거하거나, 별도 시험 항목 대신 정상 부팅 항목을 사용하십시오.
 
-If the firmware on a card never stops, the module logs it and keeps the DMA
-buffers that firmware may still use until the next power off. Power off
-before trying again.
+## 10. 상위 프로젝트 결과와 구분
 
-The kernel module and local packaging are GPL-2.0-only. The generated payload
-derives from the pinned CMP reference; NVIDIA firmware remains under its own
-terms. See `firmware/NOTICE.md` and `licenses/` for attribution and notices.
+상위 프로젝트의 원래 검증 대상은 RTX 3090 `10de:2204`입니다. 상위 기록에는 CachyOS `7.2.8-1-cachyos` / NVIDIA `615.71.09`, 시험 카드 `0000:21:00.0`, 비적용 대조 카드 `0000:01:00.0`이 등장합니다. 이는 이 문서의 Ubuntu/RTX 3060 측정과 다른 시험이며, 이 포트에서 다시 측정한 결과가 아닙니다.
+
+이 모듈은 V67/PLM 기법을 NVIDIA 드라이버 연결 전에 실행하고 SS0 `0x88888888`, SS1 `0x8`을 적용한 뒤 FLR을 수행합니다. UEFI 애플리케이션도, 수정된 NVIDIA 드라이버도 아닙니다. 이번 결과는 이 조합의 효과이며 **SS1의 독립적인 효과는 분리 검증하지 않았습니다.**
+
+## 11. 검증 자료와 라이선스
+
+로컬 시험 자료는 다음 경로에 보존했습니다. `build/` 아래 자료는 생성물이며, 원자료 전체가 이 소스 저장소에 배포된다는 의미는 아닙니다.
+
+- 적용 전: `build/benchmarks/baseline-unpatched-20261019-220350.json`.
+- 적용 후: `build/benchmarks/post-unlock-5ca2e7cf.json`.
+- 계산된 비교: `build/benchmarks/comparison-5ca2e7cf.json`.
+- 해당 부팅의 전체 커널 로그와 진단 결과: `build/deploy/combined_trial/boot-5ca2e7cf-2558-4543-a769-2681e78eb76f/`.
+
+커널 모듈과 로컬 패키징은 GPL-2.0-only입니다. 생성 페이로드는 고정된 CMP 참조에서 유래하며, NVIDIA 펌웨어는 자체 조건을 따릅니다. [firmware/NOTICE.md](firmware/NOTICE.md)와 `licenses/`의 고지를 확인하십시오. 설명 문서는 한글로 작성하되 명령어·식별자·파일명·저작권 및 라이선스 원문은 변경하지 않습니다.
